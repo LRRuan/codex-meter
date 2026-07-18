@@ -658,14 +658,10 @@ dd {
 
 .token-stats {
   display: grid;
-  grid-template-columns: 1.5fr repeat(4, 1fr);
+  grid-template-columns: 1.5fr repeat(5, 1fr);
   margin: 34px 0 22px;
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
-}
-
-.token-stats.has-subagent {
-  grid-template-columns: 1.5fr repeat(5, 1fr);
 }
 
 .token-stats .subagent-stat dd {

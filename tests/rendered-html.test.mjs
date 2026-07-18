@@ -42,6 +42,8 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(collector, /parent_thread_id/);
   assert.match(collector, /subagentSourceFiles/);
   assert.match(collector, /selectedThreadSubagentTokens/);
+  assert.match(collector, /scopedSubagentSourceFiles/);
+  assert.match(collector, /subagentTokens/);
   assert.match(collector, /selectedRepository/);
   assert.match(collector, /loopbackOrigin/);
   assert.match(collector, /bucket:\s*5 \* 60_000/);
@@ -65,7 +67,8 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(page, /viewX - padding\.left/);
   assert.match(page, /selectedThread/);
   assert.match(page, /Sub-agent Token/);
-  assert.match(page, /includedInTask/);
+  assert.match(page, /includedInScope/);
+  assert.doesNotMatch(page, /selectedThread \? <div className="subagent-stat"/);
   assert.match(page, /value: "all", label: "ALL"/);
   assert.match(page, /useState<RangeValue>\("24h"\)/);
   assert.match(page, /value: "30d", label: "30D" \}, \{ value: "all", label: "ALL"/);

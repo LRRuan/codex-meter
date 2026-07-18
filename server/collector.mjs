@@ -464,7 +464,7 @@ function readLiveAccountSnapshot() {
     send({
       method: "initialize",
       id: 0,
-      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.5.0" } },
+      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.5.1" } },
     });
   });
 }
@@ -972,9 +972,13 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
   `).get();
   const observedReset = latest ? observedQuotaHistory(now - QUOTA_RETENTION_MS, latest.ts).resets.at(-1) : null;
   const totals = totalsForRange(from, selectedSourceFiles);
-  const selectedThreadSubagentTokens = selectedThread
-    ? totalsForRange(from, selectedThread.subagentSourceFiles).total
-    : null;
+  const scopedThreads = selectedThread
+    ? [selectedThread]
+    : selectedRepository
+      ? threads.filter((thread) => thread.repositoryKey === selectedRepository.key)
+      : threads;
+  const scopedSubagentSourceFiles = [...new Set(scopedThreads.flatMap((thread) => thread.subagentSourceFiles))];
+  const subagentTokens = totalsForRange(from, scopedSubagentSourceFiles).total;
   const forecast = calculateForecast(latest, forecastWindow);
   const sampleCount = db.prepare("SELECT COUNT(*) AS count FROM usage_events").get().count;
   const quotaSampleCount = db.prepare("SELECT COUNT(*) AS count FROM quota_samples").get().count;
@@ -990,7 +994,8 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
     totals,
     scope: {
       selectedThread: selectedThread?.key ?? "all",
-      selectedThreadSubagentTokens,
+      subagentTokens,
+      selectedThreadSubagentTokens: selectedThread ? subagentTokens : null,
       selectedRepository: selectedRepository?.key ?? "all",
       repositories,
       threads: threads.map((thread) => ({
