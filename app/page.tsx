@@ -36,6 +36,7 @@ type DashboardData = {
   };
   scope: {
     selectedThread: string;
+    selectedThreadSubagentTokens: number | null;
     selectedRepository: string;
     repositories: {
       key: string;
@@ -142,7 +143,7 @@ const COPY = {
     creditsUsed: "本周估算已用", creditsBudget: "推算本周总额度", creditsRemaining: "估算剩余", tokenEquivalent: "按当前结构约剩", creditNoteA: "基于官方模型权重与当前", creditNoteB: "可识别 Token 推算，并非账户返回的官方 credits 余额。",
     threadUsage: "THREAD USAGE", repoUsage: "REPOSITORY USAGE", localUsage: "DEDUPED LOCAL USAGE", throughput: "处理量",
     repository: "仓库", allRepositories: "全部仓库", thread: "任务", allThreads: "全部任务", threads: "个任务", chartMetric: "图表指标", chartRange: "图表时间范围",
-    localTokens: "本地回溯 Token（估算）", notQuota: "非订阅额度；输入含缓存 + 输出", uncached: "非缓存输入", cached: "缓存输入", output: "输出", reasoning: "推理明细", included: "已包含在输出中",
+    localTokens: "本地回溯 Token（估算）", notQuota: "非订阅额度；输入含缓存 + 输出", subagentTokens: "Sub-agent Token", includedInTask: "已计入任务总量", uncached: "非缓存输入", cached: "缓存输入", output: "输出", reasoning: "推理明细", included: "已包含在输出中",
     officialGlobal: "账户级全局数据；不随任务筛选变化", dailyPeak: "历史单日峰值", latestDay: "最近完整日",
     creditsExplainA: "Credits 按模型对非缓存输入、缓存输入和输出分别加权；当前范围可计价覆盖 ", creditsExplainB: "%，曲线不会与原始 Token 等比例。", tokensExplain: "Token 曲线是从本机任务日志回溯出的细粒度估算；提示词、聊天历史、文件和工具结果会在多次模型调用中反复计入。账户总量请以 OFFICIAL 汇总为准。",
     gapRule: "空窗消耗记为 0，额度沿用最近采样", threadEvents: "个任务事件", repositoryThreads: "个仓库任务", tokenEvents: "个去重 Token 事件", quotaSamples: "个额度采样", localScan: "本地扫描", onlineQuota: "线上额度",
@@ -158,7 +159,7 @@ const COPY = {
     creditsUsed: "Estimated weekly used", creditsBudget: "Implied weekly budget", creditsRemaining: "Estimated remaining", tokenEquivalent: "Tokens at current mix", creditNoteA: "Estimated from official model weights with ", creditNoteB: " recognizable token coverage; not an official account credits balance.",
     threadUsage: "THREAD USAGE", repoUsage: "REPOSITORY USAGE", localUsage: "DEDUPED LOCAL USAGE", throughput: " processed",
     repository: "Repository", allRepositories: "All repositories", thread: "Thread", allThreads: "All threads", threads: "threads", chartMetric: "Chart metric", chartRange: "Chart time range",
-    localTokens: "Local reconstructed tokens (estimate)", notQuota: "Not subscription quota; input incl. cache + output", uncached: "Uncached input", cached: "Cached input", output: "Output", reasoning: "Reasoning detail", included: "Included in output",
+    localTokens: "Local reconstructed tokens (estimate)", notQuota: "Not subscription quota; input incl. cache + output", subagentTokens: "Sub-agent tokens", includedInTask: "Included in thread total", uncached: "Uncached input", cached: "Cached input", output: "Output", reasoning: "Reasoning detail", included: "Included in output",
     officialGlobal: "Account-wide data; unaffected by thread filters", dailyPeak: "Peak day", latestDay: "Latest full day",
     creditsExplainA: "Credits weight uncached input, cached input and output by model. Rated coverage in this range: ", creditsExplainB: "%; the curve is not proportional to raw tokens.", tokensExplain: "The token curve is a fine-grained estimate reconstructed from local thread logs. Prompts, chat history, files and tool results can re-enter multiple model calls. Use the OFFICIAL account total as the source of truth.",
     gapRule: "Usage gaps are 0; quota carries the latest sample", threadEvents: "thread events", repositoryThreads: "repository threads", tokenEvents: "deduplicated token events", quotaSamples: "quota samples", localScan: "Local scan", onlineQuota: "Live quota",
@@ -493,6 +494,7 @@ function demoDashboard(range: RangeValue, forecastWindow: ForecastWindow): Dashb
     totals: { input: 31_500_000, cached: 22_800_000, output: 6_900_000, reasoning: 2_100_000, total: 38_400_000, credits: 1_284, rated_tokens: 36_900_000 },
     scope: {
       selectedThread: "all",
+      selectedThreadSubagentTokens: null,
       selectedRepository: "all",
       repositories: [
         { key: "demo-repo", label: "/Users/alex/Projects/codex-meter-demo", threadCount: 3, totalTokens: 28_100_000, credits: 910, lastAt: now - 12 * 60_000 },
@@ -735,8 +737,9 @@ export default function Home() {
               </div>
             </div>
 
-            <dl className="token-stats">
+            <dl className={`token-stats ${selectedThread ? "has-subagent" : ""}`}>
               <div className="primary-stat"><dt>{copy.localTokens}</dt><dd>{formatCompact(data?.totals.total, 2, locale)}</dd><small>{copy.notQuota}</small></div>
+              {selectedThread ? <div className="subagent-stat"><dt>{copy.subagentTokens}</dt><dd>{formatCompact(data?.scope.selectedThreadSubagentTokens, 2, locale)}</dd><small>{copy.includedInTask}</small></div> : null}
               <div><dt>{copy.uncached}</dt><dd>{formatCompact(uncachedInput, 2, locale)}</dd></div>
               <div><dt>{copy.cached}</dt><dd>{formatCompact(data?.totals.cached, 2, locale)}</dd></div>
               <div><dt>{copy.output}</dt><dd>{formatCompact(data?.totals.output, 2, locale)}</dd></div>

@@ -664,6 +664,14 @@ dd {
   border-bottom: 1px solid var(--line);
 }
 
+.token-stats.has-subagent {
+  grid-template-columns: 1.5fr repeat(5, 1fr);
+}
+
+.token-stats .subagent-stat dd {
+  color: var(--violet);
+}
+
 .token-stats > div {
   min-width: 0;
   padding: 22px 24px 20px;

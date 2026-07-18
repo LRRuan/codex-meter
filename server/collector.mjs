@@ -454,7 +454,7 @@ function readLiveAccountSnapshot() {
     send({
       method: "initialize",
       id: 0,
-      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.3.1" } },
+      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.4.0" } },
     });
   });
 }
@@ -745,7 +745,7 @@ function threadMetadataByPath() {
   if (Date.now() - threadMetadataCachedAt < 15_000) return threadMetadataCache;
   try {
     const rows = codexStateDb.prepare(`
-      SELECT rollout_path, title, first_user_message, cwd, git_origin_url FROM threads
+      SELECT id, rollout_path, title, first_user_message, cwd, git_origin_url, source FROM threads
     `).all();
     threadMetadataCache = new Map(rows.map((row) => [row.rollout_path, row]));
     threadMetadataCachedAt = Date.now();
@@ -801,32 +801,83 @@ function repositoryDescriptor(metadata) {
   };
 }
 
+function subagentParentId(thread) {
+  if (!thread?.source?.startsWith("{")) return null;
+  try {
+    return JSON.parse(thread.source)?.subagent?.thread_spawn?.parent_thread_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function rootThreadMetadata(thread, metadataById) {
+  let current = thread;
+  const visited = new Set();
+  while (current) {
+    const parentId = subagentParentId(current);
+    if (!parentId || visited.has(parentId)) return current;
+    const parent = metadataById.get(parentId);
+    if (!parent) return current;
+    visited.add(parentId);
+    current = parent;
+  }
+  return thread;
+}
+
 function threadOptions(from) {
   const metadata = threadMetadataByPath();
-  return db.prepare(`
+  const metadataById = new Map([...metadata.values()].filter((thread) => thread.id).map((thread) => [thread.id, thread]));
+  const rows = db.prepare(`
     SELECT source_file, MIN(ts) AS first_at, MAX(ts) AS last_at,
       COUNT(*) AS event_count, COALESCE(SUM(total_tokens), 0) AS total_tokens,
       COALESCE(SUM(estimated_credits), 0) AS credits
     FROM usage_events WHERE ts >= ?
     GROUP BY source_file ORDER BY last_at DESC
-  `).all(from).map((row) => {
-    const threadId = threadIdFromPath(row.source_file);
-    const thread = metadata.get(row.source_file);
-    const repository = repositoryDescriptor(thread);
-    return {
-      key: hashId("thread-key-v1", row.source_file).slice(0, 16),
+  `).all(from);
+  const grouped = new Map();
+
+  for (const row of rows) {
+    const sourceMetadata = metadata.get(row.source_file);
+    const rootMetadata = rootThreadMetadata(sourceMetadata, metadataById);
+    const rootSourceFile = rootMetadata?.rollout_path ?? row.source_file;
+    const threadId = rootMetadata?.id ?? threadIdFromPath(rootSourceFile);
+    const repository = repositoryDescriptor(rootMetadata ?? sourceMetadata);
+    const current = grouped.get(rootSourceFile) ?? {
+      key: hashId("thread-key-v1", rootSourceFile).slice(0, 16),
       threadId,
-      title: readableTitle(thread?.title || thread?.first_user_message, `Thread · ${threadId.slice(-6)}`),
+      title: readableTitle(rootMetadata?.title || rootMetadata?.first_user_message, `Thread · ${threadId.slice(-6)}`),
       repositoryKey: repository.key,
       repositoryLabel: repository.label,
       firstAt: row.first_at,
       lastAt: row.last_at,
-      eventCount: row.event_count,
-      totalTokens: row.total_tokens,
-      credits: row.credits,
-      sourceFile: row.source_file,
+      eventCount: 0,
+      totalTokens: 0,
+      credits: 0,
+      sourceFiles: new Set(),
+      subagentSourceFiles: new Set(),
+      subagentTokens: 0,
     };
-  });
+    const isSubagent = Boolean(sourceMetadata && rootMetadata && sourceMetadata.id !== rootMetadata.id);
+    current.firstAt = Math.min(current.firstAt, row.first_at);
+    current.lastAt = Math.max(current.lastAt, row.last_at);
+    current.eventCount += row.event_count;
+    current.totalTokens += row.total_tokens;
+    current.credits += row.credits;
+    current.sourceFiles.add(row.source_file);
+    if (isSubagent) {
+      current.subagentSourceFiles.add(row.source_file);
+      current.subagentTokens += row.total_tokens;
+    }
+    grouped.set(rootSourceFile, current);
+  }
+
+  return [...grouped.values()]
+    .map((thread) => ({
+      ...thread,
+      sourceFiles: [...thread.sourceFiles],
+      subagentSourceFiles: [...thread.subagentSourceFiles],
+    }))
+    .sort((a, b) => b.lastAt - a.lastAt);
 }
 
 function repositoryOptions(threads) {
@@ -882,15 +933,18 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
   const selectedThread = threads.find((thread) => thread.key === requestedThreadKey) ?? null;
   const selectedRepository = repositories.find((repository) => repository.key === (selectedThread?.repositoryKey ?? requestedRepositoryKey)) ?? null;
   const selectedSourceFiles = selectedThread
-    ? [selectedThread.sourceFile]
+    ? selectedThread.sourceFiles
     : selectedRepository
-      ? threads.filter((thread) => thread.repositoryKey === selectedRepository.key).map((thread) => thread.sourceFile)
+      ? threads.filter((thread) => thread.repositoryKey === selectedRepository.key).flatMap((thread) => thread.sourceFiles)
       : null;
   const latest = db.prepare(`
     SELECT * FROM quota_samples ORDER BY ts DESC LIMIT 1
   `).get();
   const observedReset = latest ? observedQuotaHistory(now - RETENTION_MS, latest.ts).resets.at(-1) : null;
   const totals = totalsForRange(from, selectedSourceFiles);
+  const selectedThreadSubagentTokens = selectedThread
+    ? totalsForRange(from, selectedThread.subagentSourceFiles).total
+    : null;
   const forecast = calculateForecast(latest, forecastWindow);
   const sampleCount = db.prepare("SELECT COUNT(*) AS count FROM usage_events").get().count;
   const quotaSampleCount = db.prepare("SELECT COUNT(*) AS count FROM quota_samples").get().count;
@@ -905,6 +959,7 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
     totals,
     scope: {
       selectedThread: selectedThread?.key ?? "all",
+      selectedThreadSubagentTokens,
       selectedRepository: selectedRepository?.key ?? "all",
       repositories,
       threads: threads.map((thread) => ({

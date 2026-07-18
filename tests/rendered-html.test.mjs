@@ -38,7 +38,10 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(collector, /cumulative\.input/);
   assert.match(collector, /account\/rateLimits\/read/);
   assert.match(collector, /account\/usage\/read/);
-  assert.match(collector, /SELECT rollout_path, title, first_user_message, cwd, git_origin_url FROM threads/);
+  assert.match(collector, /SELECT id, rollout_path, title, first_user_message, cwd, git_origin_url, source FROM threads/);
+  assert.match(collector, /parent_thread_id/);
+  assert.match(collector, /subagentSourceFiles/);
+  assert.match(collector, /selectedThreadSubagentTokens/);
   assert.match(collector, /selectedRepository/);
   assert.match(collector, /loopbackOrigin/);
   assert.match(collector, /bucket:\s*5 \* 60_000/);
@@ -56,6 +59,8 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(page, /REPOSITORY USAGE/);
   assert.match(page, /viewX - padding\.left/);
   assert.match(page, /selectedThread/);
+  assert.match(page, /Sub-agent Token/);
+  assert.match(page, /includedInTask/);
   assert.doesNotMatch(page, /全部 Session/);
   assert.match(page, /actualSegments/);
   assert.match(page, /额度余量与耗尽预测/);
