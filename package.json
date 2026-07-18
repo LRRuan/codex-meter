@@ -1,6 +1,6 @@
 {
   "name": "codex-meter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A privacy-first local dashboard for Codex quota, token usage, refreshes, and exhaustion forecasts.",
   "private": true,
   "license": "MIT",

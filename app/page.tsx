@@ -34,10 +34,22 @@ type DashboardData = {
     rated_tokens: number;
   };
   scope: {
-    selected: string;
+    selectedSession: string;
+    selectedRepository: string;
+    repositories: {
+      key: string;
+      label: string;
+      sessionCount: number;
+      totalTokens: number;
+      credits: number;
+      lastAt: number;
+    }[];
     sessions: {
       key: string;
       sessionId: string;
+      title: string;
+      repositoryKey: string;
+      repositoryLabel: string;
       firstAt: number;
       lastAt: number;
       eventCount: number;
@@ -411,6 +423,7 @@ export default function Home() {
   const [range, setRange] = useState<RangeValue>("24h");
   const [forecastWindow, setForecastWindow] = useState<ForecastWindow>("24h");
   const [chartMetric, setChartMetric] = useState<ChartMetric>("tokens");
+  const [repositoryKey, setRepositoryKey] = useState("all");
   const [sessionKey, setSessionKey] = useState("all");
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -420,19 +433,21 @@ export default function Home() {
   const load = useCallback(async () => {
     try {
       const query = new URLSearchParams({ range, forecast: forecastWindow });
+      if (repositoryKey !== "all") query.set("repository", repositoryKey);
       if (sessionKey !== "all") query.set("session", sessionKey);
       const response = await fetch(`${apiBase()}/api/dashboard?${query}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json() as DashboardData;
       setData(payload);
-      if (payload.scope.selected !== sessionKey) setSessionKey(payload.scope.selected);
+      if (payload.scope.selectedRepository !== repositoryKey) setRepositoryKey(payload.scope.selectedRepository);
+      if (payload.scope.selectedSession !== sessionKey) setSessionKey(payload.scope.selectedSession);
       setError(null);
     } catch {
       setError("本地采集服务未连接");
     } finally {
       setLoading(false);
     }
-  }, [range, forecastWindow, sessionKey]);
+  }, [range, forecastWindow, repositoryKey, sessionKey]);
 
   useEffect(() => {
     const initialStatus = window.setTimeout(() => setOnline(navigator.onLine), 0);
@@ -475,7 +490,9 @@ export default function Home() {
   const uncachedInput = Math.max(0, (data?.totals.input ?? 0) - (data?.totals.cached ?? 0));
   const coverage = (data?.credits.coverage ?? 0) * 100;
   const latestOfficialDay = data?.accountUsage?.daily.at(-1);
-  const selectedSession = data?.scope.sessions.find((session) => session.key === data.scope.selected) ?? null;
+  const selectedSession = data?.scope.sessions.find((session) => session.key === data.scope.selectedSession) ?? null;
+  const selectedRepository = data?.scope.repositories.find((repository) => repository.key === data.scope.selectedRepository) ?? null;
+  const visibleSessions = data?.scope.sessions.filter((session) => repositoryKey === "all" || session.repositoryKey === repositoryKey) ?? [];
 
   return (
     <main className="dashboard-shell">
@@ -545,17 +562,37 @@ export default function Home() {
           <section className="token-panel" aria-labelledby="token-title">
             <div className="panel-heading">
               <div>
-                <p className="section-kicker violet">{selectedSession ? "SESSION USAGE" : "DEDUPED LOCAL USAGE"}</p>
-                <h2 id="token-title">{RANGE_LABELS[range]}处理量{selectedSession ? " · Session" : ""}</h2>
+                <p className="section-kicker violet">{selectedSession ? "SESSION USAGE" : selectedRepository ? "REPOSITORY USAGE" : "DEDUPED LOCAL USAGE"}</p>
+                <h2 id="token-title">
+                  {RANGE_LABELS[range]}处理量
+                  {selectedSession ? ` · ${selectedSession.title}` : selectedRepository ? ` · ${selectedRepository.label}` : ""}
+                </h2>
               </div>
               <div className="panel-actions">
+                <label className="session-filter repository-filter">
+                  <span>仓库</span>
+                  <select
+                    value={repositoryKey}
+                    onChange={(event) => {
+                      setRepositoryKey(event.target.value);
+                      setSessionKey("all");
+                    }}
+                  >
+                    <option value="all">全部仓库</option>
+                    {data?.scope.repositories.map((repository) => (
+                      <option key={repository.key} value={repository.key}>
+                        {repository.label} · {repository.sessionCount} sessions
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="session-filter">
                   <span>SESSION</span>
                   <select value={sessionKey} onChange={(event) => setSessionKey(event.target.value)}>
                     <option value="all">全部 Session</option>
-                    {data?.scope.sessions.map((session) => (
+                    {visibleSessions.map((session) => (
                       <option key={session.key} value={session.key}>
-                        {formatDateTime(session.firstAt)} · {session.sessionId.slice(-6)} · {formatCompact(session.totalTokens)}
+                        {session.title} · {session.repositoryLabel} · {formatCompact(session.totalTokens)}
                       </option>
                     ))}
                   </select>
@@ -603,7 +640,13 @@ export default function Home() {
 
             <footer className="data-footer">
               <span>空窗消耗记为 0，额度沿用最近采样</span>
-              <span>{selectedSession ? `${selectedSession.eventCount.toLocaleString("zh-CN")} 个 Session 事件` : `${data?.collector.sampleCount.toLocaleString("zh-CN") ?? 0} 个去重 Token 事件`}</span>
+              <span>
+                {selectedSession
+                  ? `${selectedSession.eventCount.toLocaleString("zh-CN")} 个 Session 事件`
+                  : selectedRepository
+                    ? `${selectedRepository.sessionCount.toLocaleString("zh-CN")} 个仓库 Session`
+                    : `${data?.collector.sampleCount.toLocaleString("zh-CN") ?? 0} 个去重 Token 事件`}
+              </span>
               <span>{data?.collector.quotaSampleCount.toLocaleString("zh-CN") ?? 0} 个额度采样</span>
               <span>本地扫描 {relativeSample(data?.collector.lastScanAt)}</span>
               <span>线上额度 {relativeSample(data?.collector.lastLiveAt)}</span>

@@ -16,12 +16,28 @@ const SCHEMA_VERSION = "5";
 const CODEX_HOME = resolve(process.env.CODEX_HOME ?? join(homedir(), ".codex"));
 const DB_PATH = resolve(process.env.CODEX_METER_DB ?? join(process.cwd(), ".data", "codex-meter.sqlite"));
 
+function latestStateDatabasePath() {
+  if (!existsSync(CODEX_HOME)) return null;
+  return readdirSync(CODEX_HOME)
+    .filter((file) => /^state_\d+\.sqlite$/.test(file))
+    .sort((a, b) => Number(b.match(/\d+/)?.[0]) - Number(a.match(/\d+/)?.[0]))
+    .map((file) => join(CODEX_HOME, file))[0] ?? null;
+}
+
 mkdirSync(dirname(DB_PATH), { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA synchronous = NORMAL");
 db.exec("CREATE TABLE IF NOT EXISTS meter_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT");
+
+let codexStateDb = null;
+try {
+  const statePath = latestStateDatabasePath();
+  if (statePath) codexStateDb = new DatabaseSync(statePath, { readOnly: true });
+} catch {
+  codexStateDb = null;
+}
 
 const storedVersion = db.prepare("SELECT value FROM meter_meta WHERE key = 'schema_version'").get()?.value;
 if (storedVersion !== SCHEMA_VERSION) {
@@ -503,7 +519,13 @@ function forecastWindowMs(value) {
   return 24 * 60 * 60_000;
 }
 
-function aggregateUsage(from, to, bucketMs, sourceFile = null) {
+function usageSourceFilter(sourceFiles) {
+  if (sourceFiles == null) return { sql: "", params: [] };
+  if (!sourceFiles.length) return { sql: " AND 0", params: [] };
+  return { sql: ` AND source_file IN (${sourceFiles.map(() => "?").join(", ")})`, params: sourceFiles };
+}
+
+function aggregateUsage(from, to, bucketMs, sourceFiles = null) {
   const count = Math.ceil((to - from) / bucketMs);
   const buckets = Array.from({ length: count }, (_, index) => ({
     ts: from + index * bucketMs,
@@ -514,17 +536,12 @@ function aggregateUsage(from, to, bucketMs, sourceFile = null) {
     total: 0,
     credits: 0,
   }));
-  const usageRows = sourceFile
-    ? db.prepare(`
-        SELECT ts, input_tokens, cached_input_tokens, output_tokens,
-          reasoning_tokens, total_tokens, estimated_credits
-        FROM usage_events WHERE ts >= ? AND ts <= ? AND source_file = ? ORDER BY ts ASC
-      `).all(from, to, sourceFile)
-    : db.prepare(`
-        SELECT ts, input_tokens, cached_input_tokens, output_tokens,
-          reasoning_tokens, total_tokens, estimated_credits
-        FROM usage_events WHERE ts >= ? AND ts <= ? ORDER BY ts ASC
-      `).all(from, to);
+  const filter = usageSourceFilter(sourceFiles);
+  const usageRows = db.prepare(`
+    SELECT ts, input_tokens, cached_input_tokens, output_tokens,
+      reasoning_tokens, total_tokens, estimated_credits
+    FROM usage_events WHERE ts >= ? AND ts <= ?${filter.sql} ORDER BY ts ASC
+  `).all(from, to, ...filter.params);
   for (const row of usageRows) {
     const index = Math.min(count - 1, Math.max(0, Math.floor((row.ts - from) / bucketMs)));
     const bucket = buckets[index];
@@ -692,20 +709,8 @@ function buildQuotaWindow(latest, forecast) {
   return { startAt, now, endAt, resetJumps: history.resets, points };
 }
 
-function totalsForRange(from, sourceFile = null) {
-  if (sourceFile) {
-    return db.prepare(`
-      SELECT
-        COALESCE(SUM(input_tokens), 0) AS input,
-        COALESCE(SUM(cached_input_tokens), 0) AS cached,
-        COALESCE(SUM(output_tokens), 0) AS output,
-        COALESCE(SUM(reasoning_tokens), 0) AS reasoning,
-        COALESCE(SUM(total_tokens), 0) AS total,
-        COALESCE(SUM(estimated_credits), 0) AS credits,
-        COALESCE(SUM(CASE WHEN estimated_credits IS NOT NULL THEN total_tokens ELSE 0 END), 0) AS rated_tokens
-      FROM usage_events WHERE ts >= ? AND source_file = ?
-    `).get(from, sourceFile);
-  }
+function totalsForRange(from, sourceFiles = null) {
+  const filter = usageSourceFilter(sourceFiles);
   return db.prepare(`
     SELECT
       COALESCE(SUM(input_tokens), 0) AS input,
@@ -715,8 +720,8 @@ function totalsForRange(from, sourceFile = null) {
       COALESCE(SUM(total_tokens), 0) AS total,
       COALESCE(SUM(estimated_credits), 0) AS credits,
       COALESCE(SUM(CASE WHEN estimated_credits IS NOT NULL THEN total_tokens ELSE 0 END), 0) AS rated_tokens
-    FROM usage_events WHERE ts >= ?
-  `).get(from);
+    FROM usage_events WHERE ts >= ?${filter.sql}
+  `).get(from, ...filter.params);
 }
 
 function sessionIdFromPath(sourceFile) {
@@ -725,23 +730,103 @@ function sessionIdFromPath(sourceFile) {
   return match?.[1] ?? hashId("session-id", sourceFile).slice(0, 12);
 }
 
+let threadMetadataCachedAt = 0;
+let threadMetadataCache = new Map();
+
+function threadMetadataByPath() {
+  if (!codexStateDb) return threadMetadataCache;
+  if (Date.now() - threadMetadataCachedAt < 15_000) return threadMetadataCache;
+  try {
+    const rows = codexStateDb.prepare(`
+      SELECT rollout_path, title, first_user_message, cwd, git_origin_url FROM threads
+    `).all();
+    threadMetadataCache = new Map(rows.map((row) => [row.rollout_path, row]));
+    threadMetadataCachedAt = Date.now();
+  } catch {
+    // Keep the last readable snapshot while Codex rotates or locks its state DB.
+  }
+  return threadMetadataCache;
+}
+
+function readableTitle(value, fallback) {
+  const text = String(value ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return text ? `${text.slice(0, 76)}${text.length > 76 ? "…" : ""}` : fallback;
+}
+
+function remoteRepository(origin) {
+  if (!origin) return null;
+  const value = String(origin).trim();
+  try {
+    const url = new URL(value);
+    const slug = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    if (!slug) return null;
+    return { identity: `remote:${url.hostname.toLowerCase()}/${slug.toLowerCase()}`, label: slug };
+  } catch {
+    const match = value.match(/^(?:[^@]+@)?([^:]+):(.+?)(?:\.git)?$/);
+    if (!match) return null;
+    const slug = match[2].replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    return { identity: `remote:${match[1].toLowerCase()}/${slug.toLowerCase()}`, label: slug };
+  }
+}
+
+function repositoryDescriptor(metadata) {
+  const remote = remoteRepository(metadata?.git_origin_url);
+  if (remote) return { key: hashId("repository-v1", remote.identity).slice(0, 16), label: remote.label, remote: true };
+  const cwd = String(metadata?.cwd ?? "").trim();
+  const label = cwd ? basename(cwd) : "未识别仓库";
+  return {
+    key: hashId("repository-v1", `local:${cwd || "unknown"}`).slice(0, 16),
+    label: cwd ? `本地 · ${label}` : label,
+    remote: false,
+  };
+}
+
 function sessionOptions(from) {
+  const metadata = threadMetadataByPath();
   return db.prepare(`
     SELECT source_file, MIN(ts) AS first_at, MAX(ts) AS last_at,
       COUNT(*) AS event_count, COALESCE(SUM(total_tokens), 0) AS total_tokens,
       COALESCE(SUM(estimated_credits), 0) AS credits
     FROM usage_events WHERE ts >= ?
     GROUP BY source_file ORDER BY last_at DESC
-  `).all(from).map((row) => ({
-    key: hashId("session-key-v1", row.source_file).slice(0, 16),
-    sessionId: sessionIdFromPath(row.source_file),
-    firstAt: row.first_at,
-    lastAt: row.last_at,
-    eventCount: row.event_count,
-    totalTokens: row.total_tokens,
-    credits: row.credits,
-    sourceFile: row.source_file,
-  }));
+  `).all(from).map((row) => {
+    const sessionId = sessionIdFromPath(row.source_file);
+    const thread = metadata.get(row.source_file);
+    const repository = repositoryDescriptor(thread);
+    return {
+      key: hashId("session-key-v1", row.source_file).slice(0, 16),
+      sessionId,
+      title: readableTitle(thread?.title || thread?.first_user_message, `Session · ${sessionId.slice(-6)}`),
+      repositoryKey: repository.key,
+      repositoryLabel: repository.label,
+      firstAt: row.first_at,
+      lastAt: row.last_at,
+      eventCount: row.event_count,
+      totalTokens: row.total_tokens,
+      credits: row.credits,
+      sourceFile: row.source_file,
+    };
+  });
+}
+
+function repositoryOptions(sessions) {
+  const repositories = new Map();
+  for (const session of sessions) {
+    const current = repositories.get(session.repositoryKey) ?? {
+      key: session.repositoryKey,
+      label: session.repositoryLabel,
+      sessionCount: 0,
+      totalTokens: 0,
+      credits: 0,
+      lastAt: 0,
+    };
+    current.sessionCount += 1;
+    current.totalTokens += session.totalTokens;
+    current.credits += session.credits;
+    current.lastAt = Math.max(current.lastAt, session.lastAt);
+    repositories.set(session.repositoryKey, current);
+  }
+  return [...repositories.values()].sort((a, b) => b.lastAt - a.lastAt);
 }
 
 function creditEstimate(latest, rangeTotals, observedResetAt) {
@@ -768,17 +853,24 @@ function creditEstimate(latest, rangeTotals, observedResetAt) {
   };
 }
 
-function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null) {
+function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null, requestedRepositoryKey = null) {
   const now = Date.now();
   const { duration, bucket } = rangeConfig(rangeValue);
   const from = now - duration;
   const sessions = sessionOptions(now - RETENTION_MS);
+  const repositories = repositoryOptions(sessions);
   const selectedSession = sessions.find((session) => session.key === requestedSessionKey) ?? null;
+  const selectedRepository = repositories.find((repository) => repository.key === requestedRepositoryKey) ?? null;
+  const selectedSourceFiles = selectedSession
+    ? [selectedSession.sourceFile]
+    : selectedRepository
+      ? sessions.filter((session) => session.repositoryKey === selectedRepository.key).map((session) => session.sourceFile)
+      : null;
   const latest = db.prepare(`
     SELECT * FROM quota_samples ORDER BY ts DESC LIMIT 1
   `).get();
   const observedReset = latest ? observedQuotaHistory(now - RETENTION_MS, latest.ts).resets.at(-1) : null;
-  const totals = totalsForRange(from, selectedSession?.sourceFile ?? null);
+  const totals = totalsForRange(from, selectedSourceFiles);
   const forecast = calculateForecast(latest, forecastWindow);
   const sampleCount = db.prepare("SELECT COUNT(*) AS count FROM usage_events").get().count;
   const quotaSampleCount = db.prepare("SELECT COUNT(*) AS count FROM quota_samples").get().count;
@@ -789,13 +881,18 @@ function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null
     generatedAt: now,
     range: rangeValue,
     retentionDays: RETENTION_DAYS,
-    series: aggregateUsage(from, now, bucket, selectedSession?.sourceFile ?? null),
+    series: aggregateUsage(from, now, bucket, selectedSourceFiles),
     totals,
     scope: {
-      selected: selectedSession?.key ?? "all",
+      selectedSession: selectedSession?.key ?? "all",
+      selectedRepository: selectedRepository?.key ?? "all",
+      repositories,
       sessions: sessions.map((session) => ({
         key: session.key,
         sessionId: session.sessionId,
+        title: session.title,
+        repositoryKey: session.repositoryKey,
+        repositoryLabel: session.repositoryLabel,
         firstAt: session.firstAt,
         lastAt: session.lastAt,
         eventCount: session.eventCount,
@@ -846,31 +943,44 @@ function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null
   };
 }
 
-function sendJson(response, status, body) {
+function loopbackOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return null;
+  try {
+    const hostname = new URL(origin).hostname;
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname) ? origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function sendJson(request, response, status, body) {
+  const origin = loopbackOrigin(request);
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
+    ...(origin ? { "Access-Control-Allow-Origin": origin, Vary: "Origin" } : {}),
     "Access-Control-Allow-Methods": "GET, OPTIONS",
   });
   response.end(status === 204 ? undefined : JSON.stringify(body));
 }
 
 const server = createServer((request, response) => {
-  if (request.method === "OPTIONS") return sendJson(response, 204, {});
+  if (request.method === "OPTIONS") return sendJson(request, response, 204, {});
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${HOST}:${PORT}`}`);
   if (request.method === "GET" && url.pathname === "/api/dashboard") {
     const requestedRange = url.searchParams.get("range");
     const requestedForecast = url.searchParams.get("forecast");
     const requestedSession = url.searchParams.get("session");
+    const requestedRepository = url.searchParams.get("repository");
     const range = ["24h", "7d", "30d"].includes(requestedRange) ? requestedRange : "30d";
     const forecastWindow = ["6h", "24h", "72h"].includes(requestedForecast) ? requestedForecast : "24h";
-    return sendJson(response, 200, dashboardPayload(range, forecastWindow, requestedSession));
+    return sendJson(request, response, 200, dashboardPayload(range, forecastWindow, requestedSession, requestedRepository));
   }
   if (request.method === "GET" && url.pathname === "/api/health") {
-    return sendJson(response, 200, { ok: true, lastScanAt, lastScanError, lastLiveAt, lastLiveError });
+    return sendJson(request, response, 200, { ok: true, lastScanAt, lastScanError, lastLiveAt, lastLiveError });
   }
-  return sendJson(response, 404, { error: "Not found" });
+  return sendJson(request, response, 404, { error: "Not found" });
 });
 
 await scan();
@@ -891,6 +1001,7 @@ server.listen(PORT, HOST, () => {
 function shutdown() {
   if (liveTimer) clearTimeout(liveTimer);
   server.close(() => {
+    codexStateDb?.close();
     db.close();
     process.exit(0);
   });

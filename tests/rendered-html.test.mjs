@@ -38,6 +38,9 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(collector, /cumulative\.input/);
   assert.match(collector, /account\/rateLimits\/read/);
   assert.match(collector, /account\/usage\/read/);
+  assert.match(collector, /SELECT rollout_path, title, first_user_message, cwd, git_origin_url FROM threads/);
+  assert.match(collector, /selectedRepository/);
+  assert.match(collector, /loopbackOrigin/);
   assert.match(collector, /bucket:\s*5 \* 60_000/);
   assert.match(collector, /tokenTotal:\s*bucket\.total/);
   assert.match(collector, /quotaUsed:\s*carriedQuota/);
@@ -48,7 +51,9 @@ test("keeps the P0 data guarantees in collector and UI", async () => {
   assert.match(page, /实际点位/);
   assert.match(page, /余量 \{selected\.remaining\.toFixed\(1\)\}%/);
   assert.match(page, /全部 Session/);
+  assert.match(page, /全部仓库/);
   assert.match(page, /SESSION USAGE/);
+  assert.match(page, /REPOSITORY USAGE/);
   assert.match(page, /actualSegments/);
   assert.match(page, /额度余量与耗尽预测/);
   assert.match(page, /空窗消耗记为 0，额度沿用最近采样/);

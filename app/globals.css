@@ -286,6 +286,8 @@ dd {
 .panel-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
@@ -316,6 +318,10 @@ dd {
   font: inherit;
   font-size: 11px;
   cursor: pointer;
+}
+
+.repository-filter select {
+  width: min(210px, 26vw);
 }
 
 .forecast-caption {
