@@ -454,7 +454,7 @@ function readLiveAccountSnapshot() {
     send({
       method: "initialize",
       id: 0,
-      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.2.0" } },
+      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.3.1" } },
     });
   });
 }
