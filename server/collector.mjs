@@ -519,10 +519,17 @@ function forecastWindowMs(value) {
   return 24 * 60 * 60_000;
 }
 
-function usageSourceFilter(sourceFiles) {
-  if (sourceFiles == null) return { sql: "", params: [] };
-  if (!sourceFiles.length) return { sql: " AND 0", params: [] };
-  return { sql: ` AND source_file IN (${sourceFiles.map(() => "?").join(", ")})`, params: sourceFiles };
+function usageFilter(sourceFiles) {
+  const clauses = [];
+  const params = [];
+  if (sourceFiles != null) {
+    if (!sourceFiles.length) clauses.push("0");
+    else {
+      clauses.push(`source_file IN (${sourceFiles.map(() => "?").join(", ")})`);
+      params.push(...sourceFiles);
+    }
+  }
+  return { sql: clauses.length ? ` AND ${clauses.join(" AND ")}` : "", params };
 }
 
 function aggregateUsage(from, to, bucketMs, sourceFiles = null) {
@@ -536,7 +543,7 @@ function aggregateUsage(from, to, bucketMs, sourceFiles = null) {
     total: 0,
     credits: 0,
   }));
-  const filter = usageSourceFilter(sourceFiles);
+  const filter = usageFilter(sourceFiles);
   const usageRows = db.prepare(`
     SELECT ts, input_tokens, cached_input_tokens, output_tokens,
       reasoning_tokens, total_tokens, estimated_credits
@@ -710,7 +717,7 @@ function buildQuotaWindow(latest, forecast) {
 }
 
 function totalsForRange(from, sourceFiles = null) {
-  const filter = usageSourceFilter(sourceFiles);
+  const filter = usageFilter(sourceFiles);
   return db.prepare(`
     SELECT
       COALESCE(SUM(input_tokens), 0) AS input,
@@ -724,10 +731,10 @@ function totalsForRange(from, sourceFiles = null) {
   `).get(from, ...filter.params);
 }
 
-function sessionIdFromPath(sourceFile) {
+function threadIdFromPath(sourceFile) {
   const file = basename(sourceFile, ".jsonl");
   const match = file.match(/([0-9a-f]{8}-[0-9a-f-]{27})$/i);
-  return match?.[1] ?? hashId("session-id", sourceFile).slice(0, 12);
+  return match?.[1] ?? hashId("thread-id", sourceFile).slice(0, 12);
 }
 
 let threadMetadataCachedAt = 0;
@@ -773,15 +780,28 @@ function repositoryDescriptor(metadata) {
   const remote = remoteRepository(metadata?.git_origin_url);
   if (remote) return { key: hashId("repository-v1", remote.identity).slice(0, 16), label: remote.label, remote: true };
   const cwd = String(metadata?.cwd ?? "").trim();
-  const label = cwd ? basename(cwd) : "未识别仓库";
+  let repositoryPath = cwd ? resolve(cwd) : "";
+  if (repositoryPath) {
+    let cursor = repositoryPath;
+    for (;;) {
+      if (existsSync(join(cursor, ".git"))) {
+        repositoryPath = cursor;
+        break;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) break;
+      cursor = parent;
+    }
+  }
+  const identity = repositoryPath ? `local:${repositoryPath}` : "local:unknown";
   return {
-    key: hashId("repository-v1", `local:${cwd || "unknown"}`).slice(0, 16),
-    label: cwd ? `本地 · ${label}` : label,
+    key: hashId("repository-v2", identity).slice(0, 16),
+    label: repositoryPath || "Unknown repository",
     remote: false,
   };
 }
 
-function sessionOptions(from) {
+function threadOptions(from) {
   const metadata = threadMetadataByPath();
   return db.prepare(`
     SELECT source_file, MIN(ts) AS first_at, MAX(ts) AS last_at,
@@ -790,13 +810,13 @@ function sessionOptions(from) {
     FROM usage_events WHERE ts >= ?
     GROUP BY source_file ORDER BY last_at DESC
   `).all(from).map((row) => {
-    const sessionId = sessionIdFromPath(row.source_file);
+    const threadId = threadIdFromPath(row.source_file);
     const thread = metadata.get(row.source_file);
     const repository = repositoryDescriptor(thread);
     return {
-      key: hashId("session-key-v1", row.source_file).slice(0, 16),
-      sessionId,
-      title: readableTitle(thread?.title || thread?.first_user_message, `Session · ${sessionId.slice(-6)}`),
+      key: hashId("thread-key-v1", row.source_file).slice(0, 16),
+      threadId,
+      title: readableTitle(thread?.title || thread?.first_user_message, `Thread · ${threadId.slice(-6)}`),
       repositoryKey: repository.key,
       repositoryLabel: repository.label,
       firstAt: row.first_at,
@@ -809,22 +829,22 @@ function sessionOptions(from) {
   });
 }
 
-function repositoryOptions(sessions) {
+function repositoryOptions(threads) {
   const repositories = new Map();
-  for (const session of sessions) {
-    const current = repositories.get(session.repositoryKey) ?? {
-      key: session.repositoryKey,
-      label: session.repositoryLabel,
-      sessionCount: 0,
+  for (const thread of threads) {
+    const current = repositories.get(thread.repositoryKey) ?? {
+      key: thread.repositoryKey,
+      label: thread.repositoryLabel,
+      threadCount: 0,
       totalTokens: 0,
       credits: 0,
       lastAt: 0,
     };
-    current.sessionCount += 1;
-    current.totalTokens += session.totalTokens;
-    current.credits += session.credits;
-    current.lastAt = Math.max(current.lastAt, session.lastAt);
-    repositories.set(session.repositoryKey, current);
+    current.threadCount += 1;
+    current.totalTokens += thread.totalTokens;
+    current.credits += thread.credits;
+    current.lastAt = Math.max(current.lastAt, thread.lastAt);
+    repositories.set(thread.repositoryKey, current);
   }
   return [...repositories.values()].sort((a, b) => b.lastAt - a.lastAt);
 }
@@ -853,18 +873,18 @@ function creditEstimate(latest, rangeTotals, observedResetAt) {
   };
 }
 
-function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null, requestedRepositoryKey = null) {
+function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null, requestedRepositoryKey = null) {
   const now = Date.now();
   const { duration, bucket } = rangeConfig(rangeValue);
   const from = now - duration;
-  const sessions = sessionOptions(now - RETENTION_MS);
-  const repositories = repositoryOptions(sessions);
-  const selectedSession = sessions.find((session) => session.key === requestedSessionKey) ?? null;
-  const selectedRepository = repositories.find((repository) => repository.key === requestedRepositoryKey) ?? null;
-  const selectedSourceFiles = selectedSession
-    ? [selectedSession.sourceFile]
+  const threads = threadOptions(now - RETENTION_MS);
+  const repositories = repositoryOptions(threads);
+  const selectedThread = threads.find((thread) => thread.key === requestedThreadKey) ?? null;
+  const selectedRepository = repositories.find((repository) => repository.key === (selectedThread?.repositoryKey ?? requestedRepositoryKey)) ?? null;
+  const selectedSourceFiles = selectedThread
+    ? [selectedThread.sourceFile]
     : selectedRepository
-      ? sessions.filter((session) => session.repositoryKey === selectedRepository.key).map((session) => session.sourceFile)
+      ? threads.filter((thread) => thread.repositoryKey === selectedRepository.key).map((thread) => thread.sourceFile)
       : null;
   const latest = db.prepare(`
     SELECT * FROM quota_samples ORDER BY ts DESC LIMIT 1
@@ -884,20 +904,20 @@ function dashboardPayload(rangeValue, forecastWindow, requestedSessionKey = null
     series: aggregateUsage(from, now, bucket, selectedSourceFiles),
     totals,
     scope: {
-      selectedSession: selectedSession?.key ?? "all",
+      selectedThread: selectedThread?.key ?? "all",
       selectedRepository: selectedRepository?.key ?? "all",
       repositories,
-      sessions: sessions.map((session) => ({
-        key: session.key,
-        sessionId: session.sessionId,
-        title: session.title,
-        repositoryKey: session.repositoryKey,
-        repositoryLabel: session.repositoryLabel,
-        firstAt: session.firstAt,
-        lastAt: session.lastAt,
-        eventCount: session.eventCount,
-        totalTokens: session.totalTokens,
-        credits: session.credits,
+      threads: threads.map((thread) => ({
+        key: thread.key,
+        threadId: thread.threadId,
+        title: thread.title,
+        repositoryKey: thread.repositoryKey,
+        repositoryLabel: thread.repositoryLabel,
+        firstAt: thread.firstAt,
+        lastAt: thread.lastAt,
+        eventCount: thread.eventCount,
+        totalTokens: thread.totalTokens,
+        credits: thread.credits,
       })),
     },
     credits: creditEstimate(latest, totals, observedReset?.ts ?? null),
@@ -971,11 +991,11 @@ const server = createServer((request, response) => {
   if (request.method === "GET" && url.pathname === "/api/dashboard") {
     const requestedRange = url.searchParams.get("range");
     const requestedForecast = url.searchParams.get("forecast");
-    const requestedSession = url.searchParams.get("session");
+    const requestedThread = url.searchParams.get("thread") ?? url.searchParams.get("session");
     const requestedRepository = url.searchParams.get("repository");
     const range = ["24h", "7d", "30d"].includes(requestedRange) ? requestedRange : "30d";
     const forecastWindow = ["6h", "24h", "72h"].includes(requestedForecast) ? requestedForecast : "24h";
-    return sendJson(request, response, 200, dashboardPayload(range, forecastWindow, requestedSession, requestedRepository));
+    return sendJson(request, response, 200, dashboardPayload(range, forecastWindow, requestedThread, requestedRepository));
   }
   if (request.method === "GET" && url.pathname === "/api/health") {
     return sendJson(request, response, 200, { ok: true, lastScanAt, lastScanError, lastLiveAt, lastLiveError });

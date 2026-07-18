@@ -1,8 +1,8 @@
 {
   "name": "codex-meter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A privacy-first local dashboard for Codex quota, token usage, refreshes, and exhaustion forecasts.",
-  "private": true,
+  "private": false,
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,36 +15,54 @@
   "engines": {
     "node": ">=22.13.0"
   },
+  "bin": {
+    "codex-meter": "bin/codex-meter.mjs"
+  },
+  "files": [
+    "app",
+    "bin",
+    "dist",
+    "public",
+    "scripts",
+    "server",
+    "worker",
+    "next.config.ts",
+    "postcss.config.mjs",
+    "wrangler.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dashboard": "node scripts/start-dashboard.mjs",
     "collector": "node server/collector.mjs",
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "prepare": "npm run build",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
     "next": "16.2.6",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
-  },
-  "devDependencies": {
+    "react-dom": "19.2.6",
     "@cloudflare/vite-plugin": "1.37.1",
     "@tailwindcss/postcss": "4.2.1",
-    "@types/node": "22.19.19",
-    "@types/react": "19.2.14",
-    "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
-    "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
     "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",
-    "typescript": "5.9.3",
     "vinext": "0.0.50",
     "vite": "8.0.13",
     "wrangler": "4.92.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "typescript": "5.9.3"
   },
   "type": "module"
 }

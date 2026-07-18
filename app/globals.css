@@ -53,6 +53,13 @@ button {
   margin-bottom: 24px;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
 .brand-block {
   display: flex;
   align-items: center;
@@ -823,6 +830,11 @@ dd {
   .panel-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .topbar-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .status-pill {
