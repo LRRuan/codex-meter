@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type RangeValue = "24h" | "7d" | "30d";
+type RangeValue = "all" | "24h" | "7d" | "30d";
 type ForecastWindow = "6h" | "24h" | "72h";
 type ChartMetric = "tokens" | "credits";
 type Confidence = "low" | "medium" | "high";
@@ -23,7 +23,8 @@ type SeriesPoint = {
 type DashboardData = {
   generatedAt: number;
   range: RangeValue;
-  retentionDays: number;
+  tokenHistoryStartAt: number;
+  quotaRetentionDays: number;
   series: SeriesPoint[];
   totals: {
     input: number;
@@ -125,8 +126,8 @@ type DashboardData = {
 };
 
 const RANGE_LABELS: Record<Locale, Record<RangeValue, string>> = {
-  zh: { "24h": "24 小时", "7d": "7 天", "30d": "30 天" },
-  en: { "24h": "24 hours", "7d": "7 days", "30d": "30 days" },
+  zh: { all: "全部历史", "24h": "24 小时", "7d": "7 天", "30d": "30 天" },
+  en: { all: "All time", "24h": "24 hours", "7d": "7 days", "30d": "30 days" },
 };
 
 const CONFIDENCE_LABELS: Record<Locale, Record<Confidence, string>> = {
@@ -146,7 +147,7 @@ const COPY = {
     localTokens: "本地回溯 Token（估算）", notQuota: "非订阅额度；输入含缓存 + 输出", subagentTokens: "Sub-agent Token", includedInTask: "已计入任务总量", uncached: "非缓存输入", cached: "缓存输入", output: "输出", reasoning: "推理明细", included: "已包含在输出中",
     officialGlobal: "账户级全局数据；不随任务筛选变化", dailyPeak: "历史单日峰值", latestDay: "最近完整日",
     creditsExplainA: "Credits 按模型对非缓存输入、缓存输入和输出分别加权；当前范围可计价覆盖 ", creditsExplainB: "%，曲线不会与原始 Token 等比例。", tokensExplain: "Token 曲线是从本机任务日志回溯出的细粒度估算；提示词、聊天历史、文件和工具结果会在多次模型调用中反复计入。账户总量请以 OFFICIAL 汇总为准。",
-    gapRule: "空窗消耗记为 0，额度沿用最近采样", threadEvents: "个任务事件", repositoryThreads: "个仓库任务", tokenEvents: "个去重 Token 事件", quotaSamples: "个额度采样", localScan: "本地扫描", onlineQuota: "线上额度",
+    gapRule: "空窗消耗记为 0，额度沿用最近采样", historySince: "Token 历史始于", threadEvents: "个任务事件", repositoryThreads: "个仓库任务", tokenEvents: "个去重 Token 事件", quotaSamples: "个额度采样", localScan: "本地扫描", onlineQuota: "线上额度",
     noSample: "暂无", secondsAgo: "秒前", minutesAgo: "分钟前", hoursAgo: "小时前", daysAgo: "天前", now: "现在",
     quotaAria: "额度实际余量与预计耗尽轨迹；悬停可查看点位数值", currentUsage: "当前额度使用率", usedAria: "额度已使用", waitingQuota: "等待额度样本", expectedExhaustion: "预计耗尽", projectedPoint: "预测点位", actualPoint: "实际点位", remaining: "余量", used: "已用", legend: "图例", actualRemaining: "实际余量", projectedRemaining: "速度不变时的预计余量", resetJump: "实际刷新跳变", forecastMethod: "按百分比突然回到满额识别实际刷新；预测只使用最近一次实际刷新后的数据，图表仍保留刷新前窗口。",
     tokenChartAria: "Token 用量时间序列，空窗记为零", creditsChartAria: "估算 credits 消耗时间序列，空窗记为零", creditsAria: "credits 估算", officialAria: "Codex 官方账户 Token 汇总", language: "语言",
@@ -162,7 +163,7 @@ const COPY = {
     localTokens: "Local reconstructed tokens (estimate)", notQuota: "Not subscription quota; input incl. cache + output", subagentTokens: "Sub-agent tokens", includedInTask: "Included in thread total", uncached: "Uncached input", cached: "Cached input", output: "Output", reasoning: "Reasoning detail", included: "Included in output",
     officialGlobal: "Account-wide data; unaffected by thread filters", dailyPeak: "Peak day", latestDay: "Latest full day",
     creditsExplainA: "Credits weight uncached input, cached input and output by model. Rated coverage in this range: ", creditsExplainB: "%; the curve is not proportional to raw tokens.", tokensExplain: "The token curve is a fine-grained estimate reconstructed from local thread logs. Prompts, chat history, files and tool results can re-enter multiple model calls. Use the OFFICIAL account total as the source of truth.",
-    gapRule: "Usage gaps are 0; quota carries the latest sample", threadEvents: "thread events", repositoryThreads: "repository threads", tokenEvents: "deduplicated token events", quotaSamples: "quota samples", localScan: "Local scan", onlineQuota: "Live quota",
+    gapRule: "Usage gaps are 0; quota carries the latest sample", historySince: "Token history since", threadEvents: "thread events", repositoryThreads: "repository threads", tokenEvents: "deduplicated token events", quotaSamples: "quota samples", localScan: "Local scan", onlineQuota: "Live quota",
     noSample: "none", secondsAgo: "s ago", minutesAgo: "m ago", hoursAgo: "h ago", daysAgo: "d ago", now: "now",
     quotaAria: "Actual quota remaining and forecast trajectory; hover for values", currentUsage: "Current quota usage", usedAria: "Quota used", waitingQuota: "Waiting for quota samples", expectedExhaustion: "est. exhaustion", projectedPoint: "Projected point", actualPoint: "Actual point", remaining: "Remaining", used: "Used", legend: "Legend", actualRemaining: "Actual remaining", projectedRemaining: "Projected remaining at constant rate", resetJump: "Observed reset", forecastMethod: "Observed resets are detected when the percentage suddenly returns to full. Forecasting uses samples after the latest observed reset while the chart retains earlier history.",
     tokenChartAria: "Token usage time series; gaps are zero", creditsChartAria: "Estimated credits time series; gaps are zero", creditsAria: "Credits estimate", officialAria: "Official Codex account token summary", language: "Language",
@@ -197,7 +198,9 @@ function formatAxisTime(value: number, range: RangeValue, locale: Locale = "zh")
   return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US",
     range === "24h"
       ? { hour: "2-digit", minute: "2-digit", hour12: false }
-      : { month: "numeric", day: "numeric" },
+      : range === "all"
+        ? { year: "2-digit", month: "numeric", day: "numeric" }
+        : { month: "numeric", day: "numeric" },
   ).format(value);
 }
 
@@ -461,8 +464,8 @@ function UsageChart({ data, range, metric, locale }: { data: SeriesPoint[]; rang
 
 function demoDashboard(range: RangeValue, forecastWindow: ForecastWindow): DashboardData {
   const now = Date.now();
-  const duration = range === "24h" ? 24 * 3_600_000 : range === "7d" ? 7 * 86_400_000 : 30 * 86_400_000;
-  const bucket = range === "24h" ? 5 * 60_000 : range === "7d" ? 30 * 60_000 : 2 * 3_600_000;
+  const duration = range === "24h" ? 24 * 3_600_000 : range === "7d" ? 7 * 86_400_000 : range === "30d" ? 30 * 86_400_000 : 120 * 86_400_000;
+  const bucket = range === "24h" ? 5 * 60_000 : range === "7d" ? 30 * 60_000 : range === "30d" ? 2 * 3_600_000 : 6 * 3_600_000;
   const count = Math.ceil(duration / bucket);
   const series = Array.from({ length: count }, (_, index) => {
     const active = (index * 17) % 29 < 7;
@@ -489,7 +492,8 @@ function demoDashboard(range: RangeValue, forecastWindow: ForecastWindow): Dashb
   return {
     generatedAt: now,
     range,
-    retentionDays: 30,
+    tokenHistoryStartAt: now - duration,
+    quotaRetentionDays: 30,
     series,
     totals: { input: 31_500_000, cached: 22_800_000, output: 6_900_000, reasoning: 2_100_000, total: 38_400_000, credits: 1_284, rated_tokens: 36_900_000 },
     scope: {
@@ -732,7 +736,7 @@ export default function Home() {
                   label={copy.chartRange}
                   value={range}
                   onChange={setRange}
-                  options={[{ value: "24h", label: "24H" }, { value: "7d", label: "7D" }, { value: "30d", label: "30D" }]}
+                  options={[{ value: "24h", label: "24H" }, { value: "7d", label: "7D" }, { value: "30d", label: "30D" }, { value: "all", label: "ALL" }]}
                 />
               </div>
             </div>
@@ -766,6 +770,7 @@ export default function Home() {
 
             <footer className="data-footer">
               <span>{copy.gapRule}</span>
+              <span>{copy.historySince} {formatDateTime(data?.tokenHistoryStartAt, locale)}</span>
               <span>
                 {selectedThread
                   ? `${selectedThread.eventCount.toLocaleString(locale === "zh" ? "zh-CN" : "en-US")} ${copy.threadEvents}`

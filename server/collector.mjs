@@ -10,9 +10,10 @@ const PORT = Number(process.env.CODEX_METER_PORT ?? 8787);
 const HOST = process.env.CODEX_METER_HOST ?? "127.0.0.1";
 const POLL_MS = Number(process.env.CODEX_METER_POLL_MS ?? 15_000);
 const LIVE_POLL_MS = Number(process.env.CODEX_METER_LIVE_POLL_MS ?? 60_000);
-const RETENTION_DAYS = 30;
-const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const QUOTA_RETENTION_DAYS = 30;
+const QUOTA_RETENTION_MS = QUOTA_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const SCHEMA_VERSION = "5";
+const USAGE_INDEX_VERSION = "lifetime-v1";
 const CODEX_HOME = resolve(process.env.CODEX_HOME ?? join(homedir(), ".codex"));
 const DB_PATH = resolve(process.env.CODEX_METER_DB ?? join(process.cwd(), ".data", "codex-meter.sqlite"));
 
@@ -107,6 +108,17 @@ db.prepare(`
   ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `).run(SCHEMA_VERSION);
 
+const storedUsageIndexVersion = db.prepare("SELECT value FROM meter_meta WHERE key = 'usage_index_version'").get()?.value;
+if (storedUsageIndexVersion !== USAGE_INDEX_VERSION) {
+  // Token rows and offsets are derived indexes. Rebuild them once so upgrades from
+  // the old 30-day policy recover every event still present in local Codex logs.
+  db.exec("DELETE FROM usage_events; DELETE FROM file_state;");
+  db.prepare(`
+    INSERT INTO meter_meta(key, value) VALUES ('usage_index_version', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(USAGE_INDEX_VERSION);
+}
+
 const insertEvent = db.prepare(`
   INSERT OR IGNORE INTO usage_events (
     id, ts, source_file, model, service_tier, input_tokens, cached_input_tokens,
@@ -155,7 +167,6 @@ const writeState = db.prepare(`
     cumulative_reasoning = excluded.cumulative_reasoning,
     cumulative_total = excluded.cumulative_total
 `);
-const purgeEvents = db.prepare("DELETE FROM usage_events WHERE ts < ?");
 const purgeQuota = db.prepare("DELETE FROM quota_samples WHERE ts < ?");
 
 let scanInProgress = false;
@@ -276,7 +287,7 @@ function ingestLine(line, sourceFile, state) {
 
   if (entry.type !== "event_msg" || entry.payload?.type !== "token_count") return 0;
   const ts = Date.parse(entry.timestamp);
-  if (!Number.isFinite(ts) || ts < Date.now() - RETENTION_MS) return 0;
+  if (!Number.isFinite(ts)) return 0;
 
   const payload = entry.payload;
   const { delta, cumulative } = deltaUsage(state, payload);
@@ -312,7 +323,7 @@ function ingestLine(line, sourceFile, state) {
   }
 
   const rate = payload.rate_limits?.primary;
-  if (rate && Number.isFinite(Number(rate.used_percent))) {
+  if (ts >= Date.now() - QUOTA_RETENTION_MS && rate && Number.isFinite(Number(rate.used_percent))) {
     insertQuota.run(
       hashId(
         "quota-log-v2",
@@ -388,14 +399,13 @@ async function scan() {
   scanInProgress = true;
   lastScanError = null;
   try {
-    const cutoff = Date.now() - RETENTION_MS;
+    const quotaCutoff = Date.now() - QUOTA_RETENTION_MS;
     const roots = [join(CODEX_HOME, "sessions"), join(CODEX_HOME, "archived_sessions")];
-    const files = roots.flatMap(walkJsonl).filter((file) => statSync(file).mtimeMs >= cutoff).sort();
+    const files = roots.flatMap(walkJsonl).sort();
     let imported = 0;
     for (const file of files) imported += await processFile(file);
     importedThisRun += imported;
-    purgeEvents.run(cutoff);
-    purgeQuota.run(cutoff);
+    purgeQuota.run(quotaCutoff);
     lastScanAt = Date.now();
   } catch (error) {
     lastScanError = error instanceof Error ? error.message : String(error);
@@ -454,7 +464,7 @@ function readLiveAccountSnapshot() {
     send({
       method: "initialize",
       id: 0,
-      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.4.0" } },
+      params: { clientInfo: { name: "codex_meter", title: "Codex Meter", version: "0.5.0" } },
     });
   });
 }
@@ -507,10 +517,13 @@ async function pollLiveQuota() {
   }
 }
 
-function rangeConfig(value) {
+function rangeConfig(value, from = 0, to = 0) {
   if (value === "24h") return { duration: 24 * 60 * 60_000, bucket: 5 * 60_000 };
   if (value === "7d") return { duration: 7 * 24 * 60 * 60_000, bucket: 30 * 60_000 };
-  return { duration: 30 * 24 * 60 * 60_000, bucket: 2 * 60 * 60_000 };
+  if (value === "30d") return { duration: 30 * 24 * 60 * 60_000, bucket: 2 * 60 * 60_000 };
+  const span = Math.max(5 * 60_000, to - from);
+  const bucket = Math.max(5 * 60_000, Math.ceil(span / 480 / (5 * 60_000)) * 5 * 60_000);
+  return { duration: span, bucket };
 }
 
 function forecastWindowMs(value) {
@@ -533,7 +546,7 @@ function usageFilter(sourceFiles) {
 }
 
 function aggregateUsage(from, to, bucketMs, sourceFiles = null) {
-  const count = Math.ceil((to - from) / bucketMs);
+  const count = Math.max(1, Math.ceil((to - from) / bucketMs));
   const buckets = Array.from({ length: count }, (_, index) => ({
     ts: from + index * bucketMs,
     input: 0,
@@ -731,6 +744,13 @@ function totalsForRange(from, sourceFiles = null) {
   `).get(from, ...filter.params);
 }
 
+function earliestUsageAt(sourceFiles = null) {
+  const filter = usageFilter(sourceFiles);
+  return db.prepare(`
+    SELECT MIN(ts) AS ts FROM usage_events WHERE 1 = 1${filter.sql}
+  `).get(...filter.params)?.ts ?? null;
+}
+
 function threadIdFromPath(sourceFile) {
   const file = basename(sourceFile, ".jsonl");
   const match = file.match(/([0-9a-f]{8}-[0-9a-f-]{27})$/i);
@@ -745,7 +765,7 @@ function threadMetadataByPath() {
   if (Date.now() - threadMetadataCachedAt < 15_000) return threadMetadataCache;
   try {
     const rows = codexStateDb.prepare(`
-      SELECT id, rollout_path, title, first_user_message, cwd, git_origin_url, source FROM threads
+      SELECT id, rollout_path, title, first_user_message, cwd, git_origin_url, source, created_at_ms FROM threads
     `).all();
     threadMetadataCache = new Map(rows.map((row) => [row.rollout_path, row]));
     threadMetadataCachedAt = Date.now();
@@ -848,7 +868,7 @@ function threadOptions(from) {
       title: readableTitle(rootMetadata?.title || rootMetadata?.first_user_message, `Thread · ${threadId.slice(-6)}`),
       repositoryKey: repository.key,
       repositoryLabel: repository.label,
-      firstAt: row.first_at,
+      firstAt: Math.min(row.first_at, Number(rootMetadata?.created_at_ms) || row.first_at),
       lastAt: row.last_at,
       eventCount: 0,
       totalTokens: 0,
@@ -926,9 +946,8 @@ function creditEstimate(latest, rangeTotals, observedResetAt) {
 
 function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null, requestedRepositoryKey = null) {
   const now = Date.now();
-  const { duration, bucket } = rangeConfig(rangeValue);
-  const from = now - duration;
-  const threads = threadOptions(now - RETENTION_MS);
+  const earliestGlobalUsageAt = earliestUsageAt();
+  const threads = threadOptions(earliestGlobalUsageAt ?? now);
   const repositories = repositoryOptions(threads);
   const selectedThread = threads.find((thread) => thread.key === requestedThreadKey) ?? null;
   const selectedRepository = repositories.find((repository) => repository.key === (selectedThread?.repositoryKey ?? requestedRepositoryKey)) ?? null;
@@ -937,10 +956,21 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
     : selectedRepository
       ? threads.filter((thread) => thread.repositoryKey === selectedRepository.key).flatMap((thread) => thread.sourceFiles)
       : null;
+  const taskHistoryStartAt = selectedThread
+    ? selectedThread.firstAt
+    : selectedRepository
+      ? Math.min(...threads.filter((thread) => thread.repositoryKey === selectedRepository.key).map((thread) => thread.firstAt))
+      : threads.length
+        ? Math.min(...threads.map((thread) => thread.firstAt))
+        : null;
+  const tokenHistoryStartAt = taskHistoryStartAt ?? earliestUsageAt(selectedSourceFiles) ?? earliestGlobalUsageAt ?? now;
+  const fixedRange = rangeConfig(rangeValue);
+  const from = rangeValue === "all" ? tokenHistoryStartAt : now - fixedRange.duration;
+  const { bucket } = rangeConfig(rangeValue, from, now);
   const latest = db.prepare(`
     SELECT * FROM quota_samples ORDER BY ts DESC LIMIT 1
   `).get();
-  const observedReset = latest ? observedQuotaHistory(now - RETENTION_MS, latest.ts).resets.at(-1) : null;
+  const observedReset = latest ? observedQuotaHistory(now - QUOTA_RETENTION_MS, latest.ts).resets.at(-1) : null;
   const totals = totalsForRange(from, selectedSourceFiles);
   const selectedThreadSubagentTokens = selectedThread
     ? totalsForRange(from, selectedThread.subagentSourceFiles).total
@@ -954,7 +984,8 @@ function dashboardPayload(rangeValue, forecastWindow, requestedThreadKey = null,
   return {
     generatedAt: now,
     range: rangeValue,
-    retentionDays: RETENTION_DAYS,
+    tokenHistoryStartAt,
+    quotaRetentionDays: QUOTA_RETENTION_DAYS,
     series: aggregateUsage(from, now, bucket, selectedSourceFiles),
     totals,
     scope: {
@@ -1048,7 +1079,7 @@ const server = createServer((request, response) => {
     const requestedForecast = url.searchParams.get("forecast");
     const requestedThread = url.searchParams.get("thread") ?? url.searchParams.get("session");
     const requestedRepository = url.searchParams.get("repository");
-    const range = ["24h", "7d", "30d"].includes(requestedRange) ? requestedRange : "30d";
+    const range = ["24h", "7d", "30d", "all"].includes(requestedRange) ? requestedRange : "24h";
     const forecastWindow = ["6h", "24h", "72h"].includes(requestedForecast) ? requestedForecast : "24h";
     return sendJson(request, response, 200, dashboardPayload(range, forecastWindow, requestedThread, requestedRepository));
   }
@@ -1061,9 +1092,7 @@ const server = createServer((request, response) => {
 await scan();
 setInterval(scan, POLL_MS).unref();
 setInterval(() => {
-  const cutoff = Date.now() - RETENTION_MS;
-  purgeEvents.run(cutoff);
-  purgeQuota.run(cutoff);
+  purgeQuota.run(Date.now() - QUOTA_RETENTION_MS);
 }, 60 * 60_000).unref();
 pollLiveQuota();
 
